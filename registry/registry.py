@@ -1,23 +1,96 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-from dataclasses import dataclass
+import sys
+from dataclasses import dataclass, field, replace
 from functools import partial
 from inspect import signature
-from typing import Any, Callable, Dict, Generic, Iterator, List, Optional, ParamSpec, TypeVar, cast
+from typing import Any, Callable, Dict, Generic, Iterator, List, Optional, Type, TypeVar, Union, cast
+
+
+if sys.version_info < (3, 10):
+    from typing_extensions import ParamSpec
+else:
+    from typing import ParamSpec
+
+
+if sys.version_info < (3, 11):
+    from typing_extensions import Self  # type: ignore
+else:
+    from typing import Self
 
 
 T = TypeVar("T")
 U = TypeVar("U")
+F = TypeVar("F", bound="RegisteredFunction")
 P = ParamSpec("P")
+
+P_cast = ParamSpec("P_cast")
+T_cast = TypeVar("T_cast")
+
+C = Union[Callable[P, T], Type[Callable[P, T]]]
 
 _REGISTERED_FUNCTION = Dict[str, Any]
 
 
-@dataclass
+def iterate_arg_names(func: Callable) -> Iterator[str]:
+    r"""Iterates over the arg names of a callable"""
+    sig = signature(func)
+    for name, param in sig.parameters.items():
+        if param.kind == param.POSITIONAL_OR_KEYWORD:
+            yield name
+
+
+def has_var_kwargs(func: Callable) -> bool:
+    r"""Check if a callable supports **kwargs"""
+    sig = signature(func)
+    return any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
+
+
+def bind_relevant_kwargs(func: Callable[..., T], **kwargs) -> Callable[..., T]:
+    r"""Binds keyword args to a callable"""
+    if not kwargs:
+        return func
+
+    # for a function with **kwargs, we can bind everything
+    if has_var_kwargs(func):
+        return partial(func, **kwargs)
+
+    # for functions without **kwargs, only bind kwargs that appear in function signature
+    arg_names = set(iterate_arg_names(func))
+    kwargs_to_bind = {k: v for k, v in kwargs.items() if k in arg_names}
+    return partial(func, **kwargs_to_bind)
+
+
+@dataclass(frozen=True)
 class RegisteredFunction(Generic[P, T]):
     fn: Callable[P, T]
     name: str
-    metadata: Dict[str, Any]
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def is_type(self) -> bool:
+        r"""Checks if ``fn`` is a type"""
+        return isinstance(self.fn, type)
+
+    def instantiate(self, **kwargs) -> Any:
+        if self.is_type:
+            fn = bind_relevant_kwargs(self.fn, **kwargs)()
+            return replace(self, fn=fn)
+        return self
+
+    def instantiate_with_metadata(self, **kwargs) -> Any:
+        kwargs = {**self.metadata, **kwargs}
+        return self.instantiate(**kwargs)
+
+    def cast(self: Self, typ: Type[Callable[P_cast, T_cast]]) -> "RegisteredFunction[P_cast, T_cast]":
+        return self  # type: ignore
+
+    def bind(self: Self, **kwargs) -> Self:
+        return replace(self, fn=bind_relevant_kwargs(self.fn, **kwargs))
+
+    def bind_metadata(self: Self, **kwargs) -> Self:
+        kwargs = {**self.metadata, **kwargs}
+        return self.bind(**kwargs)
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> T:
         return self.fn(*args, **kwargs)
@@ -34,10 +107,13 @@ class Registry(Generic[P, T]):
         bound: A callable from which to bind generic type variables. Used only for type checking.
     """
 
-    def __init__(self, name: str, bind_metadata: bool = False, bound: Optional[Callable[P, T]] = None) -> None:
+    def __init__(
+        self,
+        name: str,
+        bound: Optional[Type[Callable[P, T]]] = None,
+    ) -> None:
         self.name = name
         self.functions: Dict[str, RegisteredFunction[P, T]] = {}
-        self.bind_metadata = bind_metadata
 
     def __len__(self) -> int:
         return len(self.functions)
@@ -46,28 +122,18 @@ class Registry(Generic[P, T]):
         return any(key == e.name for e in self.functions.values())
 
     def __repr__(self) -> str:
-        return (
-            f"{self.__class__.__name__}(name={self.name}, "
-            f"bind_metadata={self.bind_metadata}, "
-            f"functions={self.functions.keys()})"
-        )
+        return f"{self.__class__.__name__}(name={self.name}, " f"functions={self.functions.keys()})"
 
-    def get(self, key: str, **kwargs) -> Callable[P, T]:
-        item = self.get_with_metadata(key)
-        fn = cast(Callable[P, T], item.fn)
-        metadata = item.metadata
-        # bind registered metadata if requested, preferring **kwargs as overrides
-        if self.bind_metadata:
-            kwargs = {**metadata, **kwargs}
-        # if the function doesn't support **kwargs, filter kwargs to bind based on signature
-        if not self._has_var_kwargs(fn):
-            kwargs = {k: v for k, v in kwargs.items() if k in self._iterate_arg_names(fn)}
-        return partial(fn, **kwargs) if kwargs else fn
-
-    def get_with_metadata(self, key: str) -> RegisteredFunction[P, T]:
-        if key not in self:
-            raise KeyError(f"Key: {key} is not in {type(self).__name__}. Available keys: {self.available_keys()}")
-        return self.functions[key]
+    def get(self, key: Union[str, Callable[P, T]]) -> RegisteredFunction[P, T]:
+        if isinstance(key, str):
+            if key not in self:
+                raise KeyError(f"Key: {key} is not in {type(self).__name__}. Available keys: {self.available_keys()}")
+            result = self.functions[key]
+        elif callable(key):
+            result = RegisteredFunction(key, "", {})
+        else:
+            raise TypeError(f"`key` should be str or callable, found {type(key)}")
+        return cast(RegisteredFunction[P, T], result)
 
     def remove(self, key: str) -> None:
         self.functions.pop(key)
@@ -125,15 +191,3 @@ class Registry(Generic[P, T]):
 
     def available_keys(self) -> List[str]:
         return sorted(self.functions.keys())
-
-    @staticmethod
-    def _iterate_arg_names(func: Callable) -> Iterator[str]:
-        sig = signature(func)
-        for name, param in sig.parameters.items():
-            if param.kind == param.POSITIONAL_OR_KEYWORD:
-                yield name
-
-    @staticmethod
-    def _has_var_kwargs(func: Callable) -> bool:
-        sig = signature(func)
-        return any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())

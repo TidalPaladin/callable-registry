@@ -74,7 +74,7 @@ def install(version):
         author="Scott Chase Waggener",
         author_email="tidalpaladin@gmail.com",
         packages=find_packages(""),
-        install_requires=[],
+        install_requires=["typing-extensions"],
         extras_require=extras,
         python_requires=">=3.10",
     )
